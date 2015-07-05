@@ -142,6 +142,12 @@ extern bool ap_cfg_running;
 extern bool ap_fw_loaded;
 #endif
 
+#ifdef SET_RANDOM_MAC_SOFTAP
+#ifndef CONFIG_DHD_SET_RANDOM_MAC_VAL
+#define CONFIG_DHD_SET_RANDOM_MAC_VAL	0x001A11
+#endif
+static u32 vendor_oui = CONFIG_DHD_SET_RANDOM_MAC_VAL;
+#endif
 
 #ifdef ENABLE_ADAPTIVE_SCHED
 #define DEFAULT_CPUFREQ_THRESH		1000000	/* threshold frequency : 1000000 = 1GHz */
@@ -912,6 +918,7 @@ static void	dhd_if_flush_sta(dhd_if_t * ifp);
 /* Construct/Destruct a sta pool. */
 static int dhd_sta_pool_init(dhd_pub_t *dhdp, int max_sta);
 static void dhd_sta_pool_fini(dhd_pub_t *dhdp, int max_sta);
+static void dhd_sta_pool_clear(dhd_pub_t *dhdp, int max_sta);
 
 
 /* Return interface pointer */
@@ -1082,6 +1089,56 @@ dhd_sta_pool_fini(dhd_pub_t *dhdp, int max_sta)
 	id16_map_fini(dhdp->osh, dhdp->staid_allocator);
 	dhdp->staid_allocator = NULL;
 }
+
+
+
+/* Clear the pool of dhd_sta_t objects for built-in type driver */
+static void
+dhd_sta_pool_clear(dhd_pub_t *dhdp, int max_sta)
+{
+	int idx, sta_pool_memsz;
+	dhd_sta_t * sta;
+	dhd_sta_pool_t * sta_pool;
+	void *staid_allocator;
+
+	if (!dhdp) {
+		DHD_ERROR(("%s: dhdp is NULL\n", __FUNCTION__));
+		return;
+	}
+
+	sta_pool = (dhd_sta_pool_t *)dhdp->sta_pool;
+	staid_allocator = dhdp->staid_allocator;
+
+	if (!sta_pool) {
+		DHD_ERROR(("%s: sta_pool is NULL\n", __FUNCTION__));
+		return;
+	}
+
+	if (!staid_allocator) {
+		DHD_ERROR(("%s: staid_allocator is NULL\n", __FUNCTION__));
+		return;
+	}
+
+	/* clear free pool */
+	sta_pool_memsz = ((max_sta + 1) * sizeof(dhd_sta_t));
+	bzero((uchar *)sta_pool, sta_pool_memsz);
+
+	/* dhd_sta objects per radio are managed in a table. id#0 reserved. */
+	id16_map_clear(staid_allocator, max_sta, 1);
+
+	/* Initialize all sta(s) for the pre-allocated free pool. */
+	for (idx = max_sta; idx >= 1; idx--) { /* skip sta_pool[0] */
+		sta = &sta_pool[idx];
+		sta->idx = id16_map_alloc(staid_allocator);
+		ASSERT(sta->idx <= max_sta);
+	}
+	/* Now place them into the pre-allocated free pool. */
+	for (idx = 1; idx <= max_sta; idx++) {
+		sta = &sta_pool[idx];
+		dhd_sta_free(dhdp, sta);
+	}
+}
+
 
 /** Find STA with MAC address ea in an interface's STA list. */
 dhd_sta_t *
@@ -1645,7 +1702,7 @@ dhd_ifidx2hostidx(dhd_info_t *dhd, int ifidx)
 	ASSERT(dhd);
 
 	if (ifidx < 0 || ifidx >= DHD_MAX_IFS) {
-		DHD_ERROR(("%s: ifidx %d out of range\n", __FUNCTION__, ifidx));
+		DHD_TRACE(("%s: ifidx %d out of range\n", __FUNCTION__, ifidx));
 		return 0;	/* default - the primary interface */
 	}
 
@@ -1944,7 +2001,7 @@ dhd_ifadd_event_handler(void *handle, void *event_info, u8 event)
 	}
 #ifdef PCIE_FULL_DONGLE
 	/* Turn on AP isolation in the firmware for interfaces operating in AP mode */
-	if (FW_SUPPORTED((&dhd->pub), ap) && (if_event->event.role != WLC_E_IF_ROLE_STA)) {
+	if (FW_SUPPORTED((&dhd->pub), ap) && !(DHD_IF_ROLE_STA(if_event->event.role))) {
 		char iovbuf[WLC_IOCTL_SMLEN];
 		uint32 var_int =  1;
 
@@ -2788,7 +2845,10 @@ dhd_rx_frame(dhd_pub_t *dhdp, int ifidx, void *pktbuf, int numpkt, uint8 chan)
 			continue;
 #endif /* DHD_DONOT_FORWARD_BCMEVENT_AS_NETWORK_PKT */
 		} else {
-			tout_rx = DHD_PACKET_TIMEOUT_MS;
+			if (skb->dev->ieee80211_ptr && skb->dev->ieee80211_ptr->ps == false)
+				tout_rx = CUSTOM_DHCP_LOCK_xTIME * DHD_PACKET_TIMEOUT_MS;
+			else
+				tout_rx = DHD_PACKET_TIMEOUT_MS;
 
 #ifdef PROP_TXSTATUS
 			dhd_wlfc_save_rxpath_ac_time(dhdp, (uint8)PKTPRIO(skb));
@@ -3823,7 +3883,7 @@ dhd_stop(struct net_device *net)
 exit:
 #if defined(WL_CFG80211)
 	if (ifidx == 0 && !dhd_download_fw_on_driverload)
-		wl_android_wifi_off(net);
+		wl_android_wifi_off(net, TRUE);
 #endif
 	dhd->pub.rxcnt_timeout = 0;
 	dhd->pub.txcnt_timeout = 0;
@@ -4494,6 +4554,11 @@ dhd_attach(osl_t *osh, struct dhd_bus *bus, uint bus_hdrlen)
 	dhd->pub.skip_fc = dhd_wlfc_skip_fc;
 	dhd->pub.plat_init = dhd_wlfc_plat_init;
 	dhd->pub.plat_deinit = dhd_wlfc_plat_deinit;
+#ifdef WLFC_STATE_PREALLOC
+	dhd->pub.wlfc_state = MALLOC(dhd->pub.osh, sizeof(athost_wl_status_info_t));
+	if (dhd->pub.wlfc_state == NULL)
+		DHD_ERROR(("%s: wlfc_state prealloc failed\n", __FUNCTION__));
+#endif /* WLFC_STATE_PREALLOC */
 #endif /* PROP_TXSTATUS */
 
 	/* Initialize other structure content */
@@ -5131,7 +5196,7 @@ dhd_preinit_ioctls(dhd_pub_t *dhd)
 #if defined(CUSTOMER_HW2) && defined(USE_WL_CREDALL)
 	uint32 credall = 1;
 #endif
-	uint bcn_timeout = 4;
+	uint bcn_timeout = CUSTOM_BCN_TIMEOUT_SETTING;
 	uint retry_max = 3;
 #if defined(ARP_OFFLOAD_SUPPORT)
 	int arpoe = 1;
@@ -5199,6 +5264,9 @@ dhd_preinit_ioctls(dhd_pub_t *dhd)
 #ifdef WLTDLS
 	dhd->tdls_enable = FALSE;
 #endif /* WLTDLS */
+#ifdef DONGLE_ENABLE_ISOLATION
+	dhd->dongle_isolation = TRUE;
+#endif /* DONGLE_ENABLE_ISOLATION */
 	dhd->suspend_bcn_li_dtim = CUSTOM_SUSPEND_BCN_LI_DTIM;
 	DHD_TRACE(("Enter %s\n", __FUNCTION__));
 	dhd->op_mode = 0;
@@ -5265,9 +5333,9 @@ dhd_preinit_ioctls(dhd_pub_t *dhd)
 #ifdef SET_RANDOM_MAC_SOFTAP
 		SRANDOM32((uint)jiffies);
 		rand_mac = RANDOM32();
-		iovbuf[0] = 0x02;			   /* locally administered bit */
-		iovbuf[1] = 0x1A;
-		iovbuf[2] = 0x11;
+		iovbuf[0] = (unsigned char)(vendor_oui >> 16) | 0x02;	/* locally administered bit */
+		iovbuf[1] = (unsigned char)(vendor_oui >> 8);
+		iovbuf[2] = (unsigned char)vendor_oui;
 		iovbuf[3] = (unsigned char)(rand_mac & 0x0F) | 0xF0;
 		iovbuf[4] = (unsigned char)(rand_mac >> 8);
 		iovbuf[5] = (unsigned char)(rand_mac >> 16);
@@ -6317,6 +6385,11 @@ void dhd_detach(dhd_pub_t *dhdp)
 		if (dhdp->prot)
 			dhd_prot_detach(dhdp);
 	}
+#ifdef PROP_TXSTATUS
+#ifdef WLFC_STATE_PREALLOC
+	MFREE(dhd->pub.osh, dhd->pub.wlfc_state, sizeof(athost_wl_status_info_t));
+#endif /* WLFC_STATE_PREALLOC */
+#endif /* PROP_TXSTATUS */
 
 #ifdef ARP_OFFLOAD_SUPPORT
 	if (dhd_inetaddr_notifier_registered) {
@@ -6506,6 +6579,31 @@ dhd_free(dhd_pub_t *dhdp)
 			MFREE(dhd->pub.osh, dhd, sizeof(*dhd));
 		dhd = NULL;
 	}
+}
+void
+dhd_clear(dhd_pub_t *dhdp)
+{
+	DHD_TRACE(("%s: Enter\n", __FUNCTION__));
+
+#ifdef PCIE_FULL_DONGLE
+	if (dhdp) {
+		int i;
+		for (i = 0; i < ARRAYSIZE(dhdp->reorder_bufs); i++) {
+			if (dhdp->reorder_bufs[i]) {
+				reorder_info_t *ptr;
+				uint32 buf_size = sizeof(struct reorder_info);
+				ptr = dhdp->reorder_bufs[i];
+				buf_size += ((ptr->max_idx + 1) * sizeof(void*));
+				DHD_REORDER(("free flow id buf %d, maxidx is %d, buf_size %d\n",
+					i, ptr->max_idx, buf_size));
+
+				MFREE(dhdp->osh, dhdp->reorder_bufs[i], buf_size);
+				dhdp->reorder_bufs[i] = NULL;
+			}
+		}
+		dhd_sta_pool_clear(dhdp, DHD_MAX_STA);
+	}
+#endif
 }
 
 static void
@@ -7070,11 +7168,8 @@ int
 dhd_net_bus_devreset(struct net_device *dev, uint8 flag)
 {
 	int ret = 0;
-#if defined (BCMPCIE)
-	int retry = POWERUP_MAX_RETRY;
-#endif
-	dhd_info_t *dhd = DHD_DEV_INFO(dev);
 
+	dhd_info_t *dhd = DHD_DEV_INFO(dev);
 	if (flag == TRUE) {
 		/* Issue wl down command before resetting the chip */
 		if (dhd_wl_ioctl_cmd(&dhd->pub, WLC_DOWN, NULL, 0, TRUE, 0) < 0) {
@@ -7103,101 +7198,12 @@ dhd_net_bus_devreset(struct net_device *dev, uint8 flag)
 		dhd_bus_update_fw_nv_path(dhd->pub.bus,
 			dhd->fw_path, dhd->nv_path);
 	}
-
+#endif /* BCMSDIO */
 	ret = dhd_bus_devreset(&dhd->pub, flag);
 	if (ret) {
 		DHD_ERROR(("%s: dhd_bus_devreset: %d\n", __FUNCTION__, ret));
 		return ret;
 	}
-#elif defined (BCMPCIE)
-	if(dhd_download_fw_on_driverload) {
-		ret = dhd_bus_start(&dhd->pub);
-	} else {
-		if(!flag) {
-			if(dhd->pub.busstate == DHD_BUS_DOWN) {
-				if (dhd->pub.dongle_reset) {
-					while(retry--) {
-						ret = dhdpcie_bus_clock_start(dhd->pub.bus);
-						if(!ret)
-							break;
-						else
-							OSL_SLEEP(10);
-					}
-
-					if(ret && !retry) {
-						DHD_ERROR(("%s: host pcie clock enable failed: %d\n", __FUNCTION__, ret));
-						goto done;
-					}
-
-					ret = dhdpcie_bus_enable_device(dhd->pub.bus);
-					if(ret) {
-						DHD_ERROR(("%s: host configuration restore failed: %d\n", __FUNCTION__, ret));
-						goto done;
-					}
-
-					ret = dhdpcie_bus_dongle_attach(dhd->pub.bus);
-					if(ret) {
-						DHD_ERROR(("%s: dhd_bus_start: %d\n", __FUNCTION__, ret));
-						goto done;
-					}
-				}
-				dhd->pub.dongle_reset = FALSE;
-
-				ret = dhd_bus_start(&dhd->pub);
-				if(ret) {
-					DHD_ERROR(("%s: dhd_bus_start: %d\n", __FUNCTION__, ret));
-					goto done;
-				}
-			} else {
-				DHD_ERROR(("%s: what should we do here\n", __FUNCTION__));
-				goto done;
-			}
-		} else {
-			if(dhd->pub.busstate != DHD_BUS_DOWN) {
-				ret = dhdpcie_bus_disable_device(dhd->pub.bus);
-				if(ret) {
-					DHD_ERROR(("%s: dhdpcie_bus_disable_device: %d\n", __FUNCTION__, ret));
-					goto done;
-				}
-
-				dhd_os_wd_timer(&dhd->pub, 0);
-				dhd_bus_stop(dhd->pub.bus, TRUE);
-				dhd_bus_release_dongle(dhd->pub.bus);
-
-				ret = dhdpcie_bus_clock_stop(dhd->pub.bus);
-				if(ret) {
-					DHD_ERROR(("%s: host clock stop failed: %d\n", __FUNCTION__, ret));
-					goto done;
-				}
-
-				dhd->pub.busstate = DHD_BUS_DOWN;
-				dhd->pub.dongle_reset = TRUE;
-				dhd_prot_clear(&dhd->pub);
-			}else {
-				ret = dhdpcie_bus_disable_device(dhd->pub.bus);
-				if(ret) {
-					DHD_ERROR(("%s: dhdpcie_bus_disable_device: %d\n", __FUNCTION__, ret));
-					goto done;
-				}
-
-				dhd_bus_release_dongle(dhd->pub.bus);
-
-				ret = dhdpcie_bus_clock_stop(dhd->pub.bus);
-				if(ret) {
-					DHD_ERROR(("%s: host clock stop failed: %d\n", __FUNCTION__, ret));
-					goto done;
-				}
-				dhd->pub.dongle_reset = TRUE;
-
-				dhd_prot_clear(&dhd->pub);
-			}
-		}
-	}
-done:
-#endif /* BCMSDIO */
-
-	if (ret)
-		dhd->pub.busstate = DHD_BUS_DOWN;
 	return ret;
 }
 

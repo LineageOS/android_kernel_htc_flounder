@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2014 NVIDIA Corporation. All rights reserved.
+ * Copyright (c) 2012-2015 NVIDIA Corporation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -55,7 +55,7 @@ static struct tlk_info *tlk_info;
 
 static int te_pin_user_pages(void *buffer, size_t size,
 			struct page **pages, unsigned long nrpages,
-			uint32_t buf_type)
+			uint32_t buf_type, struct vm_area_struct **vmas)
 {
 	int ret;
 	int nrpages_pinned;
@@ -65,9 +65,9 @@ static int te_pin_user_pages(void *buffer, size_t size,
 	write = (buf_type == TE_PARAM_TYPE_MEM_RW ||
 		buf_type == TE_PARAM_TYPE_PERSIST_MEM_RW);
 
-	nrpages_pinned = get_user_pages_fast((unsigned long)buffer,
-					     nrpages, write, pages);
-
+	nrpages_pinned = get_user_pages(current, current->mm,
+					(unsigned long)buffer, nrpages, write,
+					0, pages, vmas);
 	if (nrpages_pinned != nrpages)
 		goto err_pin_pages;
 
@@ -94,6 +94,7 @@ static void te_unpin_user_pages(struct page **pages,
 static int te_prep_page_list(unsigned long start,
 			     unsigned long nrpages,
 			     struct page **pages,
+			     struct vm_area_struct **vmas,
 			     struct tlk_context *context)
 {
 	size_t cb;
@@ -113,7 +114,7 @@ static int te_prep_page_list(unsigned long start,
 	pg_inf = (struct te_oper_param_page_info *)
 			((uintptr_t)dev->param_pages + dev->param_pages_tail);
 	for (i = 0; i < nrpages; i++, pg_inf++, start += PAGE_SIZE) {
-		if (te_fill_page_info(pg_inf, start, pages[i])) {
+		if (te_fill_page_info(pg_inf, start, pages[i], vmas[i])) {
 			pr_err("%s: failed to fill page info for addr 0x%p\n",
 			       __func__, (void *)start);
 			return OTE_ERROR_ACCESS_DENIED;
@@ -134,6 +135,7 @@ static int te_prep_mem_buffer(uint32_t session_id,
 	struct te_shmem_desc *shmem_desc = NULL;
 	int ret = 0;
 	unsigned long nrpages;
+	struct vm_area_struct **vmas;
 
 	nrpages = (PAGE_ALIGN((uintptr_t)buffer + size) -
 		round_down((uintptr_t)buffer, PAGE_SIZE)) /
@@ -142,14 +144,25 @@ static int te_prep_mem_buffer(uint32_t session_id,
 	shmem_desc = kzalloc(sizeof(struct te_shmem_desc) +
 			nrpages * sizeof(struct page *), GFP_KERNEL);
 	if (!shmem_desc) {
-		pr_err("%s: te_add_shmem_desc failed\n", __func__);
+		pr_err("%s: out of memory.\n", __func__);
 		ret = OTE_ERROR_OUT_OF_MEMORY;
 		goto err_shmem;
 	}
 
-	/* pin pages */
+	vmas = kzalloc(sizeof(*vmas) * nrpages, GFP_KERNEL);
+	if (!vmas) {
+		pr_err("%s: out of memory.\n", __func__);
+		ret = OTE_ERROR_OUT_OF_MEMORY;
+		goto err_alloc_vmas;
+	}
+
+	/*
+	 * mmap_sem must be taken across get user pages and scanning
+	 * the returned vmas.
+	 */
+	down_read(&current->mm->mmap_sem);
 	ret = te_pin_user_pages(buffer, size, shmem_desc->pages,
-			      nrpages, buf_type);
+			      nrpages, buf_type, vmas);
 	if (ret != OTE_SUCCESS) {
 		pr_err("%s: te_pin_user_pages failed (%d)\n",
 		       __func__, ret);
@@ -160,7 +173,7 @@ static int te_prep_mem_buffer(uint32_t session_id,
 	if (need_page_list) {
 		/* build page list */
 		ret = te_prep_page_list((unsigned long)buffer, nrpages,
-					shmem_desc->pages,
+					shmem_desc->pages, vmas,
 					context);
 		if (ret != OTE_SUCCESS) {
 			pr_err("%s: te_prep_page_list failed (%d)\n",
@@ -169,6 +182,8 @@ static int te_prep_mem_buffer(uint32_t session_id,
 		}
 	}
 #endif
+	up_read(&current->mm->mmap_sem);
+	kfree(vmas);
 
 	/* initialize rest of shmem descriptor */
 	INIT_LIST_HEAD(&(shmem_desc->list));
@@ -192,6 +207,9 @@ err_build_page_list:
 	te_unpin_user_pages(shmem_desc->pages, nrpages);
 #endif
 err_pin_pages:
+	up_read(&current->mm->mmap_sem);
+	kfree(vmas);
+err_alloc_vmas:
 	kfree(shmem_desc);
 err_shmem:
 	return ret;
@@ -648,6 +666,38 @@ int te_set_vpr_params(void *vpr_base, size_t vpr_size)
 	return 0;
 }
 EXPORT_SYMBOL(te_set_vpr_params);
+
+void te_restore_keyslots(void)
+{
+	uint32_t retval;
+
+	mutex_lock(&smc_lock);
+
+	if (current->flags &
+			(PF_WQ_WORKER | PF_NO_SETAFFINITY | PF_KTHREAD)) {
+		struct tlk_smc_work_args work_args;
+		int cpu = cpu_logical_map(smp_processor_id());
+
+		work_args.arg0 = TE_SMC_TA_EVENT;
+		work_args.arg1 = TA_EVENT_RESTORE_KEYS;
+		work_args.arg2 = 0;
+
+		/* workers don't change CPU. depending on the CPU, execute
+		 * directly or sched work */
+		if (cpu == 0 && (current->flags & PF_WQ_WORKER)) {
+			retval = tlk_generic_smc_on_cpu0(&work_args);
+		} else {
+			retval = work_on_cpu(0,
+					tlk_generic_smc_on_cpu0, &work_args);
+		}
+	} else {
+		retval = tlk_generic_smc(tlk_info, TE_SMC_TA_EVENT,
+				TA_EVENT_RESTORE_KEYS, 0, 0);
+	}
+
+	mutex_unlock(&smc_lock);
+}
+EXPORT_SYMBOL(te_restore_keyslots);
 
 static int te_allocate_session(struct tlk_context *context, uint32_t session_id,
 			       struct te_session **sessionp)

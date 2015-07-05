@@ -1,7 +1,7 @@
 /*
  * drivers/media/video/tegra/nvavp/nvavp_dev.c
  *
- * Copyright (c) 2011-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2011-2015, NVIDIA CORPORATION.  All rights reserved.
  *
  * This file is licensed under the terms of the GNU General Public License
  * version 2. This program is licensed "as is" without any warranty of any
@@ -45,7 +45,7 @@
 #include <linux/memblock.h>
 #include <linux/anon_inodes.h>
 #include <linux/tegra_pm_domains.h>
-
+#include <linux/debugfs.h>
 
 #include <linux/pm_qos.h>
 
@@ -54,6 +54,10 @@
 #include <linux/of_platform.h>
 #include <linux/of_address.h>
 #include <linux/tegra-timer.h>
+
+#ifdef CONFIG_TRUSTED_LITTLE_KERNEL
+#include <linux/ote_protocol.h>
+#endif
 
 #if defined(CONFIG_TEGRA_AVP_KERNEL_ON_MMU)
 #include "../avp/headavp.h"
@@ -171,6 +175,10 @@ struct nvavp_info {
 	struct miscdevice		audio_misc_dev;
 #endif
 	struct task_struct		*init_task;
+#ifdef CONFIG_TEGRA_NVAVP_REF_DEBUG
+    struct list_head        ref_list;
+    struct dentry           *dbg_dir;
+#endif
 };
 
 struct nvavp_clientctx {
@@ -184,6 +192,159 @@ struct nvavp_clientctx {
 	struct rb_root iova_handles;
 };
 static struct nvavp_info *nvavp_info_ctx;
+
+
+#ifdef CONFIG_TEGRA_NVAVP_REF_DEBUG
+struct nvavp_ref {
+    struct pid *pid;
+    struct list_head list;
+};
+
+static void nvavp_ref_add(struct nvavp_info *nvavp)
+{
+    struct nvavp_ref *ref;
+    struct pid *pid = get_task_pid(current, PIDTYPE_PGID);
+
+    ref = kmalloc(sizeof(struct nvavp_ref), GFP_KERNEL);
+    if (!ref)
+    {
+        pr_err("%s: failed to record Process %d as kmalloc failed!",
+            __func__, pid_nr(pid));
+        return;
+    }
+
+    ref->pid = pid;
+    list_add_tail(&ref->list, &nvavp->ref_list);
+    pr_err("nvavp: Process %d accquired a reference.\n", pid_nr(pid));
+}
+
+static inline void __nvavp_ref_remove(struct nvavp_ref *ref)
+{
+    list_del(&ref->list);
+    put_pid(ref->pid);
+    kfree(ref);
+}
+
+static void nvavp_ref_del(struct nvavp_info* nvavp)
+{
+    struct nvavp_ref *ref;
+    struct pid *pid = get_task_pid(current, PIDTYPE_PGID);
+
+    list_for_each_entry(ref, &nvavp->ref_list, list)
+        if (ref->pid == pid)
+            break;
+
+    if (&ref->list != &nvavp->ref_list)
+    {
+        pr_err("nvavp: Process %d has given up a reference\n",
+            pid_nr(pid));
+        __nvavp_ref_remove(ref);
+    }
+    else
+    {
+        pr_err("%s: Reference not found for Process %d\n",
+            __func__, pid_nr(pid));
+    }
+
+    put_pid(pid);
+}
+
+static void nvavp_ref_dump(struct nvavp_info *nvavp)
+{
+    struct nvavp_ref *ref;
+
+    pr_info("nvavp: Dumping reference list:\n");
+    list_for_each_entry(ref, &nvavp->ref_list, list)
+    {
+        if (pid_task(ref->pid, PIDTYPE_PGID))
+        {
+            pr_info("nvavp: Process %d\n", pid_nr(ref->pid));
+        }
+        else
+        {
+            pr_info("nvavp: Process %d no longer exists, "
+                "danging reference removed!\n",
+                pid_nr(ref->pid));
+            __nvavp_ref_remove(ref);
+        }
+    }
+}
+
+#ifdef CONFIG_DEBUG_FS
+static int dbg_nvavp_refs_show(struct seq_file *m, void *unused)
+{
+    struct nvavp_info *nvavp = m->private;
+    struct nvavp_ref *ref;
+
+    list_for_each_entry(ref, &nvavp->ref_list, list)
+        if (pid_task(ref->pid, PIDTYPE_PID))
+            seq_printf(m, "%d\n", pid_nr(ref->pid));
+        else
+            seq_printf(m, "%d [danging]\n", pid_nr(ref->pid));
+
+    return 0;
+}
+
+static int dbg_nvavp_refs_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, dbg_nvavp_refs_show, inode->i_private);
+}
+
+
+static const struct file_operations dbg_nvavp_refs_fops = {
+    .open       = dbg_nvavp_refs_open,
+    .read       = seq_read,
+    .llseek     = seq_lseek,
+    .release    = single_release,
+};
+
+static void nvavp_debug_create(struct nvavp_info *nvavp)
+{
+    struct dentry *dbg_dir;
+    struct dentry *ret;
+
+    dbg_dir = debugfs_create_dir("nvavp", NULL);
+    if (!dbg_dir)
+        return;
+    nvavp->dbg_dir = dbg_dir;
+    ret = debugfs_create_file("refs", S_IRUGO, dbg_dir, nvavp,
+        &dbg_nvavp_refs_fops);
+    if (!ret)
+        debugfs_remove_recursive(dbg_dir);
+}
+#else
+static int dbg_hdmi_show(struct seq_file *m, void *unused)
+{
+}
+
+static int dbg_nvavp_refs_open(struct inode *inode, struct file *file)
+{
+}
+
+static void nvavp_debug_create(struct nvavp_info *nvavp)
+{
+}
+#endif
+#endif
+
+static inline void nvavp_ref_inc(struct nvavp_info *nvavp)
+{
+    //nvavp->refcount++;
+#ifdef CONFIG_TEGRA_NVAVP_REF_DEBUG
+    nvavp_ref_add(nvavp);
+#endif
+}
+
+static inline void nvavp_ref_dec(struct nvavp_info *nvavp)
+{
+    //nvavp->refcount--;
+#ifdef CONFIG_TEGRA_NVAVP_REF_DEBUG
+    nvavp_ref_del(nvavp);
+#endif
+}
+
+
+
 
 static int nvavp_runtime_get(struct nvavp_info *nvavp)
 {
@@ -563,6 +724,7 @@ static void nvavp_clks_enable(struct nvavp_info *nvavp)
 	} else {
 		nvavp->clk_enabled++;
 	}
+    nvavp_ref_inc(nvavp);
 }
 
 static void nvavp_clks_disable(struct nvavp_info *nvavp)
@@ -581,6 +743,7 @@ static void nvavp_clks_disable(struct nvavp_info *nvavp)
 		dev_dbg(&nvavp->nvhost_dev->dev, "%s: resetting emc_clk "
 				"and sclk\n", __func__);
 	}
+    nvavp_ref_dec(nvavp);
 }
 
 static u32 nvavp_check_idle(struct nvavp_info *nvavp, int channel_id)
@@ -1281,7 +1444,7 @@ static void nvavp_uninit(struct nvavp_info *nvavp)
 	audio_initialized = nvavp_get_audio_init_status(nvavp);
 #endif
 
-	pr_debug("nvavp_uninit video_initialized(%d) audio_initialized(%d)\n",
+	pr_err("nvavp_uninit video_initialized(%d) audio_initialized(%d)\n",
 		video_initialized, audio_initialized);
 
 	/* Video and Audio both are uninitialized */
@@ -1291,7 +1454,7 @@ static void nvavp_uninit(struct nvavp_info *nvavp)
 	nvavp->init_task = current;
 
 	if (video_initialized) {
-		pr_debug("nvavp_uninit nvavp->video_initialized\n");
+		pr_err("nvavp_uninit nvavp->video_initialized\n");
 		nvavp_halt_vde(nvavp);
 		nvavp_set_video_init_status(nvavp, 0);
 		video_initialized = 0;
@@ -1307,7 +1470,7 @@ static void nvavp_uninit(struct nvavp_info *nvavp)
 
 	/* Video and Audio both becomes uninitialized */
 	if (!video_initialized && !audio_initialized) {
-		pr_debug("nvavp_uninit both channels uninitialized\n");
+		pr_err("nvavp_uninit both channels uninitialized\n");
 
 		clk_disable_unprepare(nvavp->sclk);
 		clk_disable_unprepare(nvavp->emc_clk);
@@ -1848,13 +2011,13 @@ static int tegra_nvavp_open(struct nvavp_info *nvavp,
 	struct nvavp_clientctx *clientctx;
 	int ret = 0;
 
-	dev_dbg(&nvavp->nvhost_dev->dev, "%s: ++\n", __func__);
+	dev_err(&nvavp->nvhost_dev->dev, "%s: ++\n", __func__);
 
 	clientctx = kzalloc(sizeof(*clientctx), GFP_KERNEL);
 	if (!clientctx)
 		return -ENOMEM;
 
-	pr_debug("tegra_nvavp_open channel_id (%d)\n", channel_id);
+	pr_err("tegra_nvavp_open channel_id (%d)\n", channel_id);
 
 	clientctx->channel_id = channel_id;
 
@@ -1883,7 +2046,7 @@ static int tegra_nvavp_video_open(struct inode *inode, struct file *filp)
 	struct nvavp_clientctx *clientctx;
 	int ret = 0;
 
-	pr_debug("tegra_nvavp_video_open NVAVP_VIDEO_CHANNEL\n");
+	pr_err("tegra_nvavp_video_open NVAVP_VIDEO_CHANNEL\n");
 
 	nonseekable_open(inode, filp);
 
@@ -1903,7 +2066,7 @@ static int tegra_nvavp_audio_open(struct inode *inode, struct file *filp)
 	struct nvavp_clientctx *clientctx;
 	int ret = 0;
 
-	pr_debug("tegra_nvavp_audio_open NVAVP_AUDIO_CHANNEL\n");
+	pr_err("tegra_nvavp_audio_open NVAVP_AUDIO_CHANNEL\n");
 
 	nonseekable_open(inode, filp);
 
@@ -1936,7 +2099,7 @@ static int tegra_nvavp_release(struct nvavp_clientctx *clientctx,
 	struct nvavp_info *nvavp = clientctx->nvavp;
 	int ret = 0;
 
-	dev_dbg(&nvavp->nvhost_dev->dev, "%s: ++\n", __func__);
+	dev_err(&nvavp->nvhost_dev->dev, "%s: ++\n", __func__);
 
 	if (!nvavp->refcount) {
 		dev_err(&nvavp->nvhost_dev->dev,
@@ -2426,6 +2589,12 @@ static int tegra_nvavp_probe(struct platform_device *ndev)
 	}
 #endif
 
+#ifdef CONFIG_TEGRA_NVAVP_REF_DEBUG
+    nvavp->ref_list.prev = &nvavp->ref_list;
+    nvavp->ref_list.next = &nvavp->ref_list;
+    nvavp_debug_create(nvavp);
+#endif
+
 	ret = request_irq(irq, nvavp_mbox_pending_isr, 0,
 			  TEGRA_NVAVP_NAME, nvavp);
 	if (ret) {
@@ -2531,7 +2700,9 @@ static int tegra_nvavp_remove(struct platform_device *ndev)
 				PM_QOS_CPU_FREQ_MIN_DEFAULT_VALUE);
 		pm_qos_remove_request(&nvavp->min_online_cpus_req);
 	}
-
+#ifdef CONFIG_TEGRA_NVAVP_REF_DEBUG
+    debugfs_remove_recursive(nvavp->dbg_dir);
+#endif
 	kfree(nvavp);
 	return 0;
 }
@@ -2560,7 +2731,10 @@ static int tegra_nvavp_runtime_suspend(struct device *dev)
 			ret = -EBUSY;
 		}
 	}
-
+#ifdef CONFIG_TEGRA_NVAVP_REF_DEBUG
+    if (ret == -EBUSY)
+        nvavp_ref_dump(nvavp);
+#endif
 	mutex_unlock(&nvavp->open_lock);
 
 	return ret;
@@ -2594,6 +2768,12 @@ static int tegra_nvavp_resume(struct device *dev)
 	nvavp_powergate_vde(nvavp);
 
 	tegra_nvavp_runtime_resume(dev);
+
+#ifdef CONFIG_TRUSTED_LITTLE_KERNEL
+	nvavp_clks_enable(nvavp);
+	te_restore_keyslots();
+	nvavp_clks_disable(nvavp);
+#endif
 
 	return 0;
 }

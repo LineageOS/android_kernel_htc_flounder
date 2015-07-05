@@ -150,20 +150,22 @@ void tegra30_i2s_free_gpio(struct snd_pcm_substream *substream, int i2s_id)
 	struct tegra_rt5677 *machine = snd_soc_card_get_drvdata(card);
 	struct tegra_asoc_platform_data *pdata = machine->pdata;
 	int i;
+
 	if (i2s_id > 1) {
 		/* Only HIFI_CODEC and SPEAKER GPIO need re-config */
 		return;
 	}
-
 	if (pdata->first_time_free[i2s_id]) {
 		mutex_init(&pdata->i2s_gpio_lock[i2s_id]);
 		mutex_lock(&pdata->i2s_gpio_lock[i2s_id]);
-		pr_info("pdata->gpio_free_count[%d]=%d, 1st time enter, don't need free gpio\n",
-                       i2s_id, pdata->gpio_free_count[i2s_id]);
+		pr_debug("%s: Skip gpio_free if not allocated\n", __func__);
 		pdata->first_time_free[i2s_id] = false;
-	} else {
-		mutex_lock(&pdata->i2s_gpio_lock[i2s_id]);
+		pdata->gpio_free_count[i2s_id]++;
+		mutex_unlock(&pdata->i2s_gpio_lock[i2s_id]);
+		return;
 	}
+
+	mutex_lock(&pdata->i2s_gpio_lock[i2s_id]);
 	pdata->gpio_free_count[i2s_id]++;
 	if (pdata->gpio_free_count[i2s_id] > 1) {
 		pr_debug("pdata->gpio_free_count[%d]=%d > 1, needless to free again\n",
@@ -917,10 +919,9 @@ static void tegra30_i2s_start_playback(struct tegra30_i2s *i2s)
 {
 	tegra30_ahub_enable_tx_fifo(i2s->playback_fifo_cif);
 	/* if this is the only user of i2s tx then enable it*/
-	if (i2s->playback_ref_count == 1)
-		regmap_update_bits(i2s->regmap, TEGRA30_I2S_CTRL,
-				   TEGRA30_I2S_CTRL_XFER_EN_TX,
-				   TEGRA30_I2S_CTRL_XFER_EN_TX);
+	regmap_update_bits(i2s->regmap, TEGRA30_I2S_CTRL,
+			   TEGRA30_I2S_CTRL_XFER_EN_TX,
+			   TEGRA30_I2S_CTRL_XFER_EN_TX);
 }
 
 static void tegra30_i2s_stop_playback(struct tegra30_i2s *i2s)
@@ -928,27 +929,26 @@ static void tegra30_i2s_stop_playback(struct tegra30_i2s *i2s)
 	int dcnt = 10;
 	/* if this is the only user of i2s tx then disable it*/
 	tegra30_ahub_disable_tx_fifo(i2s->playback_fifo_cif);
-	if (i2s->playback_ref_count == 1) {
-		regmap_update_bits(i2s->regmap, TEGRA30_I2S_CTRL,
-				   TEGRA30_I2S_CTRL_XFER_EN_TX, 0);
 
-		while (tegra30_ahub_tx_fifo_is_enabled(i2s->id) && dcnt--)
-			udelay(100);
+	regmap_update_bits(i2s->regmap, TEGRA30_I2S_CTRL,
+			   TEGRA30_I2S_CTRL_XFER_EN_TX, 0);
+
+	while (tegra30_ahub_tx_fifo_is_enabled(i2s->id) && dcnt--)
+		udelay(100);
+
+	dcnt = 10;
+	while (!tegra30_ahub_tx_fifo_is_empty(i2s->id) && dcnt--)
+		udelay(100);
+
+	/* In case I2S FIFO does not get empty do a soft reset of the
+	   I2S channel to prevent channel reversal in next session */
+	if (dcnt < 0) {
+		tegra30_i2s_soft_reset(i2s);
 
 		dcnt = 10;
-		while (!tegra30_ahub_tx_fifo_is_empty(i2s->id) && dcnt--)
+		while (!tegra30_ahub_tx_fifo_is_empty(i2s->id) &&
+		       dcnt--)
 			udelay(100);
-
-		/* In case I2S FIFO does not get empty do a soft reset of the
-		   I2S channel to prevent channel reversal in next session */
-		if (dcnt < 0) {
-			tegra30_i2s_soft_reset(i2s);
-
-			dcnt = 10;
-			while (!tegra30_ahub_tx_fifo_is_empty(i2s->id) &&
-			       dcnt--)
-				udelay(100);
-		}
 	}
 }
 
@@ -999,18 +999,30 @@ static int tegra30_i2s_trigger(struct snd_pcm_substream *substream, int cmd,
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 	case SNDRV_PCM_TRIGGER_RESUME:
-		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
-			tegra30_i2s_start_playback(i2s);
-		else
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+			spin_lock(&i2s->pb_lock);
+			if (!i2s->tx_enable) {
+				tegra30_i2s_start_playback(i2s);
+				i2s->tx_enable = 1;
+			}
+			spin_unlock(&i2s->pb_lock);
+		} else {
 			tegra30_i2s_start_capture(i2s);
+		}
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
-		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
-			tegra30_i2s_stop_playback(i2s);
-		else
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+			spin_lock(&i2s->pb_lock);
+			if (i2s->tx_enable) {
+				tegra30_i2s_stop_playback(i2s);
+				i2s->tx_enable = 0;
+			}
+			spin_unlock(&i2s->pb_lock);
+		} else {
 			tegra30_i2s_stop_capture(i2s);
+		}
 		break;
 	default:
 		return -EINVAL;
@@ -2438,6 +2450,8 @@ static int tegra30_i2s_platform_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "Could not register PCM: %d\n", ret);
 		goto err_unregister_dai;
 	}
+
+	spin_lock_init(&i2s->pb_lock);
 
 	return 0;
 
