@@ -898,13 +898,11 @@ static unsigned int rt5677_set_vad(
 	if (use_lock)
 		mutex_lock(&rt5677_global->vad_lock);
 
-
 	if (on && !activity) {
 		/* Kill the DSP so that all the registers are clean. */
 		set_rt5677_power_extern(false);
 
 		pr_info("rt5677_set_vad on, mic_state = %d\n", rt5677_global->mic_state);
-
 		set_rt5677_power_extern(true);
 
 		gpio_direction_output(rt5677->vad_clock_en, 1);
@@ -929,11 +927,9 @@ static unsigned int rt5677_set_vad(
 		 * wake, otherwise it will run at full power. */
 		pri99 |= rt5677->mbist_test_passed ?
 			(RT5677_MBIST_TEST_PASSED) : (RT5677_MBIST_TEST_FAILED);
-
 		/* Inform the firmware if it should go to sleep or not. */
 		pri99 |= rt5677->vad_sleep ?
 			(RT5677_VAD_SLEEP) : (RT5677_VAD_NO_SLEEP);
-
 		rt5677_dsp_mode_i2c_write(codec, RT5677_PRIV_DATA, pri99);
 
 		/* Reset the mic buffer read pointer. */

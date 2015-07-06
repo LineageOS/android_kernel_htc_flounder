@@ -10382,7 +10382,6 @@ static s32 wl_notifier_change_state(struct bcm_cfg80211 *cfg, struct net_info *_
 					wl_add_remove_pm_enable_work(cfg, FALSE, WL_HANDLER_DEL);
 				}
 			}
-
 #if defined(WLTDLS)
 #if defined(DISABLE_TDLS_IN_P2P)
 			if (cfg->vsdb_mode || p2p_is_on(cfg))
