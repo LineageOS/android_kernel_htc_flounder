@@ -202,6 +202,7 @@ static struct cma_reserved {
 	struct device *dev;
 } cma_reserved[MAX_CMA_AREAS] __initdata;
 static unsigned cma_reserved_count __initdata;
+static unsigned long cma_total_pages;
 
 static int __init cma_init_reserved_areas(void)
 {
@@ -287,6 +288,7 @@ int __init dma_declare_contiguous(struct device *dev, phys_addr_t size,
 	r->size = size;
 	r->dev = dev;
 	cma_reserved_count++;
+	cma_total_pages += ((unsigned long)size / PAGE_SIZE);
 	pr_info("CMA: reserved %ld MiB at %08lx\n", (unsigned long)size / SZ_1M,
 		(unsigned long)base);
 
@@ -296,6 +298,11 @@ int __init dma_declare_contiguous(struct device *dev, phys_addr_t size,
 err:
 	pr_err("CMA: failed to reserve %ld MiB\n", (unsigned long)size / SZ_1M);
 	return base;
+}
+
+unsigned long cma_get_total_pages(void)
+{
+	return cma_total_pages;
 }
 
 static int __dma_update_pte(pte_t *pte, pgtable_t token, unsigned long addr,
@@ -477,5 +484,63 @@ int dma_get_contiguous_stats(struct device *dev,
 	stats->size = (cma->count) << PAGE_SHIFT;
 	stats->base = (cma->base_pfn) << PAGE_SHIFT;
 
+	return 0;
+}
+
+#define MAX_REPLACE_DEV 16
+static struct device *replace_dev_list[MAX_REPLACE_DEV];
+static atomic_t replace_dev_count;
+
+bool dma_contiguous_should_replace_page(struct page *page)
+{
+	int i;
+	ulong pfn;
+	struct cma *cma;
+	struct device *dev;
+	int count = atomic_read(&replace_dev_count);
+
+	if (!page)
+		return false;
+	pfn = page_to_pfn(page);
+
+	for (i = 0; i < count; i++) {
+		dev = replace_dev_list[i];
+		if (!dev)
+			continue;
+		cma = dev->cma_area;
+		if (!cma)
+			continue;
+		if (pfn >= cma->base_pfn &&
+		    pfn < cma->base_pfn + cma->count)
+			return true;
+	}
+
+	return false;
+}
+
+/* Enable replacing pages during get_user_pages.
+ * any ref count on CMA page from get_user_pages
+ * makes the page not migratable and can cause
+ * CMA allocation failure. Enabling replace
+ * would force replacing the CMA pages with non-CMA
+ * pages during get_user_pages
+ */
+int dma_contiguous_enable_replace_pages(struct device *dev)
+{
+	int idx;
+	struct cma *cma;
+
+	if (!dev)
+		return -EINVAL;
+
+	idx = atomic_inc_return(&replace_dev_count);
+	if (idx > MAX_REPLACE_DEV)
+		return -EINVAL;
+	replace_dev_list[idx - 1] = dev;
+	cma = dev->cma_area;
+	if (cma) {
+		pr_info("enabled page replacement for spfn=%lx, epfn=%lx\n",
+			cma->base_pfn, cma->base_pfn + cma->count);
+	}
 	return 0;
 }
