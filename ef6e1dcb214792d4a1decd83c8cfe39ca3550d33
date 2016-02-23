@@ -1,0 +1,21 @@
+{
+  "comments": [
+    {
+      "key": {
+        "uuid": "ffb9cba7_6de30a07",
+        "filename": "arch/arm64/configs/flounder_defconfig",
+        "patchSetId": 1
+      },
+      "lineNbr": 99,
+      "author": {
+        "id": 2936
+      },
+      "writtenOn": "2016-02-23T00:44:33Z",
+      "side": 1,
+      "message": "Are you sure this CPU is SMT capable? IIRC none of the Tegras are.",
+      "revId": "ef6e1dcb214792d4a1decd83c8cfe39ca3550d33",
+      "serverId": "1ec6b3db-b2c1-4fa4-84a2-4c7efe89ba71",
+      "unresolved": false
+    }
+  ]
+}
