@@ -1,0 +1,9 @@
+diff a/include/linux/fs.h b/include/linux/fs.h	(rejected hunks)
+@@ -1531,6 +1531,7 @@
+ struct dir_context {
+ 	const filldir_t actor;
+ 	loff_t pos;
++	bool romnt;
+ };
+ 
+ static inline bool dir_emit(struct dir_context *ctx,

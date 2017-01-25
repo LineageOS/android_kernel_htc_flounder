@@ -1,0 +1,15 @@
+diff a/include/linux/dcache.h b/include/linux/dcache.h	(rejected hunks)
+@@ -428,6 +428,13 @@
+ 	return (dentry->d_inode == NULL);
+ }
+ 
++static inline bool d_is_su(const struct dentry *dentry)
++{
++	return dentry &&
++	       dentry->d_name.len == 2 &&
++	       !memcmp(dentry->d_name.name, "su", 2);
++}
++
+ extern int sysctl_vfs_cache_pressure;
+ 
+ #endif	/* __LINUX_DCACHE_H */
